@@ -48,36 +48,34 @@ export default function LoginForm() {
     }
   };
   
-  return (
-    <div className="space-y-6">
-      <div className="space-y-2">
-        <Label className="font-medium text-foreground text-center block">Inicia Sesión con Tu Rostro</Label>
-        <p className="text-sm text-muted-foreground text-center mb-4">
-          Primero se realizará una verificación humana por video, luego podrás capturar tu rostro para el reconocimiento.
-        </p>
-        <FaceCapture 
-          onFaceCaptured={handleFaceVerifiedAndCaptured} 
-          mainCaptureButtonTextIfLive="Capturar Rostro y Entrar"
-          context="login"
-        />
-        
-        {!authLoading && users.length === 0 && !isProcessingLogin && (
-           <p className="text-xs text-amber-600 text-center pt-2">No hay usuarios registrados. Por favor, regístrate.</p>
-        )}
-      </div>
-
-       {isProcessingLogin && (
-        <div className="flex items-center justify-center text-sm text-muted-foreground pt-2">
-            <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Verificando credenciales...
-        </div>
-       )}
-
-      <p className="text-center text-sm text-muted-foreground pt-4">
-        ¿No tienes una cuenta?{' '}
-        <Link href="/signup" className="font-medium text-primary hover:underline">
-          Regístrate
-        </Link>
+return (
+  <div className="space-y-6">
+    <div className="space-y-2">
+      <Label className="font-medium text-foreground text-center block">
+        Inicia Sesión con Tu Rostro
+      </Label>
+      <p className="text-sm text-muted-foreground text-center mb-4">
+        Primero se realizará una verificación humana por video, luego podrás capturar tu rostro para el reconocimiento.
       </p>
+      <FaceCapture 
+        onFaceCaptured={handleFaceVerifiedAndCaptured} 
+        mainCaptureButtonTextIfLive="Capturar Rostro y Entrar"
+        context="login"
+      />
+      
+      {!authLoading && users.length === 0 && !isProcessingLogin && (
+        <p className="text-xs text-amber-600 text-center pt-2">
+          No hay usuarios registrados. Por favor, regístrate.
+        </p>
+      )}
     </div>
-  );
+
+    {isProcessingLogin && (
+      <div className="flex items-center justify-center text-sm text-muted-foreground pt-2">
+        <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Verificando credenciales...
+      </div>
+    )}
+  </div>
+);
+
 }
