@@ -1,0 +1,8 @@
+Please download face-api.js model files and place them in this 'public/models' directory.
+For real-time face detection, you'll typically need:
+- Tiny Face Detector models (e.g., tiny_face_detector_model-weights_manifest.json and associated .shard files)
+- Optionally, for landmarks: Face Landmark 68 Tiny Model (face_landmark_68_tiny_model-weights_manifest.json and shards)
+
+You can find these models in the face-api.js GitHub repository (weights directory) or other online sources providing these pre-trained models.
+The application will attempt to load them from '/models/your_model_file'.
+Ensure the file names match what face-api.js expects (e.g., tiny_face_detector_model-weights_manifest.json).
