@@ -30,13 +30,28 @@ export default function UserManagementTable() {
     setIsDialogOpen(true);
   };
 
-  const handleFaceCapturedInDialog = (dataUrl: string, descriptor: number[] | null) => {
-    setNewFaceUri(dataUrl);
-    setNewFaceDescriptor(descriptor);
-     if (descriptor) {
+  const handleFaceCapturedInDialog = (dataUrl: string | null, descriptor: number[] | null, livenessVerificationPassed?: boolean) => {
+    // Para admin_update, livenessVerificationPassed usualmente será true si llegamos a la captura manual.
+    // FaceCapture maneja los toasts de error de liveness directamente.
+    // Si dataUrl o descriptor son null, la captura manual falló.
+
+    if (dataUrl && descriptor) {
+      setNewFaceUri(dataUrl);
+      setNewFaceDescriptor(descriptor);
       toast({ title: "Nuevo Rostro Procesado", description: "Nueva imagen facial y descriptor listos para actualizar." });
-    } else {
+    } else if (dataUrl && !descriptor) {
+      setNewFaceUri(dataUrl); // Guardamos el URI aunque falte el descriptor
+      setNewFaceDescriptor(null);
       toast({ title: "Rostro Capturado (Sin Descriptor)", description: "Nueva imagen facial capturada, pero no se pudo calcular el descriptor. Intenta de nuevo para un reconocimiento fiable.", variant: "default", duration: 7000 });
+    } else {
+      // Caso donde dataUrl es null (posiblemente liveness falló y no se procedió, o captura manual cancelada/fallida)
+      setNewFaceUri(null);
+      setNewFaceDescriptor(null);
+      if (livenessVerificationPassed === false) {
+        // FaceCapture ya mostró el error de liveness, no es necesario otro toast aquí.
+      } else {
+        toast({ title: "Captura Fallida", description: "No se pudo capturar la nueva imagen facial.", variant: "destructive" });
+      }
     }
   };
 
@@ -58,7 +73,7 @@ export default function UserManagementTable() {
         toast({ title: "Rostro Actualizado", description: `El rostro de inicio de sesión y descriptor de ${selectedUser.name} han sido actualizados.` });
         setIsDialogOpen(false); 
       } else {
-        // Error toasts are handled by updateUserFaceAdmin in auth context
+        // Los toasts de error son manejados por updateUserFaceAdmin en auth context
       }
     } catch (error) {
       console.error("Error updating face:", error);
@@ -135,7 +150,12 @@ export default function UserManagementTable() {
                     <Image src={selectedUser.enhancedFaceImageUri} alt="Rostro actual" width={128} height={128} className="object-cover w-full h-full" data-ai-hint="rostro persona" />
                   ) : <div className="w-full h-full flex items-center justify-center text-muted-foreground">Sin Imagen</div>}
                 </div>
-                <FaceCapture onFaceCaptured={handleFaceCapturedInDialog} imageSize={200} captureButtonText="Capturar Nuevo Rostro" />
+                <FaceCapture 
+                  onFaceCaptured={handleFaceCapturedInDialog} 
+                  context="admin_update"
+                  initialButtonText="Iniciar Verificación para Actualizar Rostro"
+                  mainCaptureButtonTextIfLive="Capturar Nuevo Rostro"
+                />
                 {newFaceUri && newFaceDescriptor && <p className="text-xs text-green-600 mt-2">Nuevo rostro y descriptor capturados. Listo para actualizar.</p>}
                 {newFaceUri && !newFaceDescriptor && <p className="text-xs text-amber-600 mt-2">Rostro capturado, descriptor falló. Intenta de nuevo.</p>}
               </div>
