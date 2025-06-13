@@ -17,8 +17,6 @@ export default function LoginForm() {
   const { toast } = useToast();
 
   const handleFaceVerifiedAndCaptured = async (faceDataUrl: string | null, faceDescriptor: number[] | null, livenessVerificationPassed?: boolean) => {
-    // El parámetro `faceDataUrl` ahora puede ser `null` si la liveness falla antes de la captura del frame.
-    
     if (authLoading) {
       toast({ title: "Sistema Ocupado", description: "El sistema de autenticación aún está cargando. Intenta en un momento.", variant: "default" });
       setIsProcessingLogin(false);
@@ -26,47 +24,44 @@ export default function LoginForm() {
     }
 
     if (livenessVerificationPassed === false) {
-      // FaceCapture ya debería haber mostrado un toast sobre la falla de liveness.
-      // Simplemente detenemos el procesamiento aquí.
       setIsProcessingLogin(false);
       return;
     }
     
-    // En este punto, livenessVerificationPassed es true o undefined (si el contexto no era login y no se pasó).
-    // Para login, asumimos que si llegamos aquí, livenessVerificationPassed fue true.
-
-    if (users.length === 0 && !authLoading) {
-      if (livenessVerificationPassed) { // Solo mostramos este mensaje si la validación humana pasó
+    if (livenessVerificationPassed) { // Liveness fue exitosa
+      if (users.length === 0) {
         toast({ 
           title: "Validación Humana Exitosa", 
           description: "Pasaste la verificación humana, pero no hay usuarios registrados. Por favor, regístrate.", 
-          variant: "default", // Los toasts default no son inherentemente verdes, pero son positivos.
+          variant: "success", 
           duration: 7000 
         });
-      } else {
-        // Este caso no debería ocurrir si livenessVerificationPassed es false (se retorna antes)
-        // o si es undefined (no es contexto de login). Pero por si acaso:
-        toast({ title: "Inicio de Sesión No Posible", description: "No hay usuarios registrados. Por favor, regístrate.", variant: "destructive" });
+        setIsProcessingLogin(false);
+        return;
       }
-      setIsProcessingLogin(false);
-      return;
-    }
-
-    if (!faceDescriptor || !faceDataUrl) {
-      // Este toast es rojo porque es un fallo en la capacidad de procesar el rostro para el login
-      toast({ title: "Rasgos Faciales No Claros", description: "No se pudieron procesar los rasgos faciales para el inicio de sesión. Intenta capturar tu rostro de nuevo.", variant: "destructive", duration: 7000 });
-      setIsProcessingLogin(false);
-      return;
+      // Si hay usuarios pero falta el descriptor o el dataUrl, es un error del proceso de captura/reconocimiento
+      if (!faceDescriptor || !faceDataUrl) {
+        toast({ title: "Rasgos Faciales No Claros", description: "No se pudieron procesar los rasgos faciales para el inicio de sesión. Intenta capturar tu rostro de nuevo.", variant: "destructive", duration: 7000 });
+        setIsProcessingLogin(false);
+        return;
+      }
+    } else { 
+      // Liveness no pasó o no se definió (no debería llegar aquí si fue explícitamente false)
+      // O si faceDescriptor/faceDataUrl faltan después de que liveness no se evaluó como explícitamente true
+      if (!faceDescriptor || !faceDataUrl) {
+        toast({ title: "Rasgos Faciales No Claros", description: "No se pudieron procesar los rasgos faciales para el inicio de sesión. Intenta capturar tu rostro de nuevo.", variant: "destructive", duration: 7000 });
+        setIsProcessingLogin(false);
+        return;
+      }
     }
     
     setIsProcessingLogin(true); 
     try {
-      const success = await loginWithFace(faceDataUrl, faceDescriptor);
+      const success = await loginWithFace(faceDataUrl!, faceDescriptor!); // faceDataUrl y faceDescriptor ya están validados arriba
       if (success) {
-        toast({ title: "Inicio de Sesión Exitoso", description: "¡Bienvenido de nuevo!" });
+        toast({ title: "Inicio de Sesión Exitoso", description: "¡Bienvenido de nuevo!", variant: "success" });
         router.push('/dashboard');
       } else {
-        // Los toasts de error son manejados en loginWithFace, pero aseguramos que el procesamiento se detenga
         setIsProcessingLogin(false); 
       }
     } catch (error) {
