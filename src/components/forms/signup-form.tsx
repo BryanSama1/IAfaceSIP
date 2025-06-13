@@ -19,46 +19,55 @@ export default function SignupForm() {
   const router = useRouter();
   const { toast } = useToast();
 
-  // Esta función es llamada por FaceCapture DESPUÉS de la verificación de liveness (video) Y la captura final de la imagen
+  // Esta función es llamada por FaceCapture DESPUÉS de la verificación de liveness (video) 
+  // Y la captura automática del fotograma para el registro.
   const handleFaceVerifiedAndCaptured = async (faceDataUrl: string | null, faceDescriptor: number[] | null, livenessVerificationPassed?: boolean) => {
-    // Para signup, livenessVerificationPassed usualmente será true si llegamos a la captura manual,
-    // o FaceCapture manejará los errores de liveness directamente.
-    // Si faceDataUrl o faceDescriptor son null aquí, es porque la captura manual falló.
     
     if (!name || !email) {
       toast({ title: "Información Faltante", description: "Por favor, completa tu nombre y correo electrónico.", variant: "destructive" });
-      return;
-    }
-    if (!faceDataUrl || !faceDescriptor) {
-      toast({ title: "Falta Captura Facial", description: "No se capturó una imagen facial o su descriptor. Intenta la verificación y captura de nuevo.", variant: "destructive", duration: 7000 });
+      setIsProcessingSignup(false); // Asegurar que no quede en estado de carga si faltan datos
       return;
     }
 
     if (livenessVerificationPassed === false) {
-      // Esto es un caso de resguardo, FaceCapture debería haber mostrado un toast si la liveness falló.
-      toast({ title: "Registro Fallido", description: "La verificación humana falló. Inténtalo de nuevo.", variant: "destructive" });
+      // FaceCapture ya debería haber mostrado un toast si la liveness falló.
+      // No es necesario un toast adicional aquí, pero sí resetear el estado de carga.
+      setIsProcessingSignup(false);
+      return;
+    }
+    
+    // Si liveness pasó (true), pero falta faceDataUrl o faceDescriptor, es un error en la captura/procesamiento del fotograma.
+    if (livenessVerificationPassed && (!faceDataUrl || !faceDescriptor)) {
+      toast({ title: "Registro Fallido", description: "No se pudo procesar el rostro para el registro. Intenta la verificación de nuevo.", variant: "destructive", duration: 7000 });
       setIsProcessingSignup(false);
       return;
     }
 
+    // Si livenessVerificationPassed es undefined (no debería pasar si el flujo es correcto), o si faceDataUrl/Descriptor faltan
+    if (livenessVerificationPassed === undefined || !faceDataUrl || !faceDescriptor) {
+        toast({ title: "Error de Registro", description: "Ocurrió un problema con la captura facial. Inténtalo de nuevo.", variant: "destructive" });
+        setIsProcessingSignup(false);
+        return;
+    }
+
+
     setIsProcessingSignup(true);
     try {
-      // Para signup, siempre pasamos el faceDataUrl y faceDescriptor de la captura manual.
+      // Para signup, siempre pasamos el faceDataUrl y faceDescriptor de la captura automática post-liveness.
       const success = await signup(name, email, faceDataUrl, faceDescriptor); 
 
       if (success) {
-        toast({ title: "Registro Exitoso", description: "Tu cuenta ha sido creada. ¡Bienvenido!" });
+        toast({ title: "Registro Exitoso", description: "Tu cuenta ha sido creada. ¡Bienvenido!", variant: "success" });
         router.push('/dashboard');
       } else {
-        // Los toasts de error son manejados en signup
-        setIsProcessingSignup(false); // Asegurar que el estado de carga se desactive si el signup falla y no redirige
+        // Los toasts de error son manejados en auth-context/signup
+        setIsProcessingSignup(false); 
       }
     } catch (error) {
       console.error("Signup error:", error);
       toast({ title: "Error de Registro", description: "Ocurrió un error inesperado. Por favor, inténtalo de nuevo.", variant: "destructive" });
       setIsProcessingSignup(false);
     }
-    // No se necesita finally aquí si el signup exitoso redirige.
   };
 
   return (
@@ -93,22 +102,28 @@ export default function SignupForm() {
       <div className="space-y-2">
         <Label className="font-medium text-foreground">Verificación y Registro Facial</Label>
         <p className="text-sm text-muted-foreground">
-          Primero se realizará una verificación humana por video. Luego, podrás capturar tu rostro para el registro.
+          Se verificará que eres una persona real y se capturará tu rostro para el registro.
         </p>
         <FaceCapture 
             onFaceCaptured={handleFaceVerifiedAndCaptured} 
-            initialButtonText="Iniciar Verificación Humana"
-            mainCaptureButtonTextIfLive="Capturar Rostro y Crear Cuenta"
+            initialButtonText="Iniciar Verificación y Registrar Cuenta"
+            // mainCaptureButtonTextIfLive ya no es relevante para signup
             context="signup" 
-            // isParentProcessing no es tan relevante aquí como en login
+            isParentProcessing={isProcessingSignup || authLoading}
         />
       </div>
 
-      {isProcessingSignup && (
+      {isProcessingSignup && !authLoading && ( // Muestra solo si esta forma está procesando
         <div className="flex items-center justify-center text-sm text-muted-foreground pt-2">
             <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Creando cuenta...
         </div>
        )}
+       {authLoading && ( // Muestra si el contexto de auth está cargando (podría ser por otra razón)
+        <div className="flex items-center justify-center text-sm text-muted-foreground pt-2">
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Cargando sistema de autenticación...
+        </div>
+       )}
+
 
       <p className="text-center text-sm text-muted-foreground pt-4">
         ¿Ya tienes una cuenta?{' '}
