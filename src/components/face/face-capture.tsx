@@ -20,7 +20,6 @@ type LivenessStep =
   | 'initial'
   | 'awaiting_models'
   | 'awaiting_camera_for_video'
-  | 'ready_to_record'
   | 'recording_video'
   | 'verifying_video_with_api'
   | 'liveness_api_passed_awaiting_final_camera' 
@@ -61,31 +60,59 @@ const FaceCapture: React.FC<FaceCaptureProps> = ({
   const { toast } = useToast();
   const detectionIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
+  // Refs for values used in callbacks that should not cause re-execution of useCallback itself
+  const livenessStepRef = useRef(livenessStep);
+  const isRecordingRef = useRef(isRecording);
+  const isCameraActiveRef = useRef(isCameraActive);
+
+  useEffect(() => { livenessStepRef.current = livenessStep; }, [livenessStep]);
+  useEffect(() => { isRecordingRef.current = isRecording; }, [isRecording]);
+  useEffect(() => { isCameraActiveRef.current = isCameraActive; }, [isCameraActive]);
+
+
   const stopCamera = useCallback((calledFrom?: string) => {
-    console.log(`FaceCapture: stopCamera llamado desde: ${calledFrom || 'desconocido'}`);
+    console.log(`FaceCapture: stopCamera llamado desde: ${calledFrom || 'desconocido'}. Current stream state: ${currentStream ? 'exists' : 'null'}`);
+    
     if (detectionIntervalRef.current) {
       clearInterval(detectionIntervalRef.current);
       detectionIntervalRef.current = null;
     }
 
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-      mediaRecorderRef.current.stop();
+    if (mediaRecorderRef.current) {
+      if (mediaRecorderRef.current.state === 'recording') {
+        mediaRecorderRef.current.stop();
+        console.log("FaceCapture: MediaRecorder detenido desde stopCamera.");
+      }
+      mediaRecorderRef.current = null; 
     }
     
     const videoElement = videoRef.current;
     if (videoElement && videoElement.srcObject) {
       const stream = videoElement.srcObject as MediaStream;
       stream.getTracks().forEach(track => track.stop());
-      console.log("FaceCapture: Pistas del flujo de medios detenidas (directo de videoRef).");
       videoElement.srcObject = null;
+      console.log("FaceCapture: Pistas del flujo de medios detenidas y srcObject anulado (desde videoRef).");
     }
-    setIsCameraActive(false);
-  }, []);
+    
+    // Explicitly check currentStream from state before setting to null
+    // to avoid issues if it was already null.
+    if (currentStream) {
+        console.log("FaceCapture: Setting currentStream to null in stopCamera.");
+        setCurrentStream(null); // This will trigger the useEffect for currentStream to clean up isCameraActive
+    } else {
+        // If currentStream is already null, ensure isCameraActive is also false.
+        if (isCameraActiveRef.current) { // Use ref to avoid stale closure
+            setIsCameraActive(false);
+            isCameraActiveRef.current = false;
+        }
+    }
+  }, [currentStream, setCurrentStream, setIsCameraActive]);
+
 
   const loadModels = useCallback(async () => {
     if (modelsLoadedRef.current) {
       setStatusMessage("Modelos faciales ya cargados.");
-      if (livenessStep !== 'initial') setLivenessStep('initial');
+      if (livenessStepRef.current !== 'initial') setLivenessStep('initial');
       return;
     }
     setLivenessStep('awaiting_models');
@@ -104,19 +131,162 @@ const FaceCapture: React.FC<FaceCaptureProps> = ({
       setLivenessStep('liveness_failed_or_error');
       toast({ title: "Error en Modelos Faciales", description: errorMsg, variant: "destructive", duration: 7000 });
     }
-  }, [toast, livenessStep]);
+  }, [toast]);
 
   useEffect(() => {
     loadModels();
   }, [loadModels]);
 
+
+  const startRecordingSequence = useCallback(async (stream: MediaStream) => {
+    console.log("FaceCapture: startRecordingSequence llamado.");
+    if (isRecordingRef.current) { // Use ref
+      console.warn("FaceCapture: Intento de iniciar grabación cuando ya se está grabando.");
+      return;
+    }
+    if (!stream || stream.getTracks().length === 0 || !stream.active) {
+      console.error("FaceCapture: startRecordingSequence llamado con un stream inválido o inactivo.");
+      setError("Error interno: el flujo de la cámara no está activo para la grabación.");
+      setLivenessStep('liveness_failed_or_error');
+      stopCamera('invalid_stream_in_startRecordingSequence');
+      return;
+    }
+
+    setIsRecording(true);
+    setLivenessStep('recording_video');
+    recordedChunksRef.current = []; 
+
+    try {
+      const options = { mimeType: 'video/webm;codecs=vp8' };
+      if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+          console.warn(`${options.mimeType} no es soportado, intentando con default.`);
+          // @ts-ignore
+          delete options.mimeType;
+      }
+      mediaRecorderRef.current = new MediaRecorder(stream, options);
+      
+      mediaRecorderRef.current.ondataavailable = (event) => {
+        if (event.data.size > 0) recordedChunksRef.current.push(event.data);
+      };
+
+      mediaRecorderRef.current.onstop = async () => {
+        console.log("FaceCapture: MediaRecorder.onstop disparado.");
+        setIsRecording(false); // Important to set before async operations
+        const videoBlob = new Blob(recordedChunksRef.current, { type: mediaRecorderRef.current?.mimeType || 'video/webm' });
+        recordedChunksRef.current = []; 
+        const tempMediaRecorderMimeType = mediaRecorderRef.current?.mimeType;
+        mediaRecorderRef.current = null; // Release MediaRecorder instance
+
+        let loginFrameDataUrl: string | null = null;
+        let loginFrameDescriptor: number[] | null = null;
+
+        if (context === 'login' && videoRef.current && captureCanvasRef.current && modelsLoadedRef.current) {
+          if (videoRef.current.readyState >= videoRef.current.HAVE_CURRENT_DATA && videoRef.current.videoWidth > 0) {
+            const video = videoRef.current;
+            const canvas = captureCanvasRef.current;
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            const ctx = canvas.getContext('2d');
+            if (ctx) {
+              ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+              loginFrameDataUrl = canvas.toDataURL('image/png');
+              try {
+                const detection = await faceapi.detectSingleFace(canvas, new faceapi.TinyFaceDetectorOptions({ inputSize: 320 }))
+                  .withFaceLandmarks().withFaceDescriptor();
+                if (detection) {
+                  loginFrameDescriptor = Array.from(detection.descriptor);
+                }
+              } catch (e) { console.error("FaceCapture: Error en descriptor de cuadro para login:", e); }
+            }
+          }
+        }
+        
+        stopCamera('video_recording_finished_before_api_call');
+        setLivenessStep('verifying_video_with_api');
+        setIsVerifyingWithAPI(true);
+
+        if (videoBlob.size > MAX_VIDEO_SIZE_MB * 1024 * 1024) {
+          toast({ title: "Video Demasiado Grande", description: `El video grabado excede los ${MAX_VIDEO_SIZE_MB}MB. Intenta de nuevo.`, variant: "destructive" });
+          setError(`Video demasiado grande (${(videoBlob.size / (1024*1024)).toFixed(2)} MB)`);
+          onFaceCaptured(null, null, false);
+          setLivenessStep('liveness_failed_or_error');
+          setIsVerifyingWithAPI(false);
+          return;
+        }
+
+        const formData = new FormData();
+        formData.append("prompt", "Verifica si la persona en el video es real y viva.");
+        formData.append("video_file", videoBlob, `liveness_video.${tempMediaRecorderMimeType?.split('/')[1].split(';')[0] || 'webm'}`);
+        try {
+          const response = await fetch("https://facesip-ia-127465468754.us-central1.run.app", { method: "POST", body: formData });
+          if (!response.ok) throw new Error(`Error de API: ${response.status} ${response.statusText}`);
+          const outerResponse = await response.json();
+          let isLivePerson = false;
+          try {
+              const innerJsonResponseString = outerResponse.response;
+              const innerJsonResponse = JSON.parse(innerJsonResponseString);
+              const finalDataString = innerJsonResponse.response;
+              const finalData = JSON.parse(finalDataString);
+              isLivePerson = finalData.isLivePerson === true;
+          } catch (parseError) { throw new Error("Respuesta de API malformada."); }
+
+          if (isLivePerson) {
+            if (context === 'login') {
+              onFaceCaptured(loginFrameDataUrl, loginFrameDescriptor, true);
+              // LivenessForm will handle UI changes based on onFaceCaptured result.
+              // For login, we might want to briefly show success then let LoginForm decide next step.
+              setLivenessStep('liveness_api_passed_awaiting_final_camera'); // Indicate liveness passed, login form will take over
+            } else { 
+              toast({ title: "Verificación Humana Exitosa", description: "Persona real detectada. Puedes proceder a la captura final.", duration: 3000 });
+              setLivenessStep('liveness_api_passed_ready_for_manual_final_capture');
+            }
+          } else {
+            toast({ title: "Verificación Humana Fallida", description: "No se pudo confirmar que eres una persona real. Intenta de nuevo.", variant: "destructive", duration: 5000 });
+            setError("Verificación de vida fallida. Asegura buena iluminación y mira a la cámara.");
+            onFaceCaptured(null, null, false);
+            setLivenessStep('liveness_failed_or_error');
+          }
+        } catch (apiError) {
+          const apiErrorMsg = apiError instanceof Error ? apiError.message : String(apiError);
+          toast({ title: "Error de Verificación", description: `No se pudo completar la verificación: ${apiErrorMsg}`, variant: "destructive" });
+          setError(`Error de comunicación con el servicio de verificación: ${apiErrorMsg}`);
+          onFaceCaptured(null, null, false);
+          setLivenessStep('liveness_failed_or_error');
+        } finally { setIsVerifyingWithAPI(false); }
+      };
+
+      mediaRecorderRef.current.start();
+      console.log("FaceCapture: MediaRecorder iniciado.");
+      setTimeout(() => {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+          mediaRecorderRef.current.stop();
+          console.log("FaceCapture: MediaRecorder detenido por timeout.");
+        }
+      }, VIDEO_RECORDING_DURATION_MS);
+    } catch (mediaRecorderError) {
+      console.error("FaceCapture: ERROR DENTRO DE startRecordingSequence al crear o iniciar MediaRecorder", mediaRecorderError);
+      const mrErrorMsg = mediaRecorderError instanceof Error ? mediaRecorderError.message : String(mediaRecorderError);
+      toast({ title: "Error de Grabación", description: `No se pudo iniciar la grabación de video. ${mrErrorMsg}`, variant: "destructive" });
+      setIsRecording(false);
+      setError(`Error al iniciar la grabación: ${mrErrorMsg}`);
+      stopCamera('media_recorder_init_error_in_startRecordingSequence');
+      onFaceCaptured(null, null, false); 
+      setLivenessStep('liveness_failed_or_error');
+    }
+  }, [context, onFaceCaptured, stopCamera, toast, setIsRecording, setLivenessStep, setError, setIsVerifyingWithAPI]);
+
+
   const startCamera = useCallback(async (purpose: 'video_liveness' | 'final_capture') => {
-    if (isStartingCamera) return;
-    if (currentStream && isCameraActive) {
-      if (purpose === 'video_liveness' && livenessStep !== 'ready_to_record' && livenessStep !== 'recording_video') {
-        if (isCameraActive) setLivenessStep('ready_to_record'); else setLivenessStep('awaiting_camera_for_video');
-      } else if (purpose === 'final_capture' && livenessStep !== 'final_capture_active' && (context === 'signup' || context === 'admin_update')) {
-        if (isCameraActive) setLivenessStep('final_capture_active'); else setLivenessStep('liveness_api_passed_awaiting_final_camera');
+    if (isStartingCamera) {
+        console.log("FaceCapture: startCamera llamado mientras ya se está iniciando, retornando.");
+        return;
+    }
+    if (currentStream && isCameraActiveRef.current) { // use Ref
+      console.log("FaceCapture: startCamera llamado pero la cámara ya está activa y con stream.");
+      if (purpose === 'video_liveness' && context === 'login' && livenessStepRef.current === 'awaiting_camera_for_video' && !isRecordingRef.current) {
+         startRecordingSequence(currentStream);
+      } else if (purpose === 'final_capture' && livenessStepRef.current !== 'final_capture_active' && (context === 'signup' || context === 'admin_update')) {
+        if (isCameraActiveRef.current) setLivenessStep('final_capture_active');
       }
       return;
     }
@@ -124,77 +294,110 @@ const FaceCapture: React.FC<FaceCaptureProps> = ({
     setError(null);
     setIsStartingCamera(true);
     setLivenessStep(purpose === 'video_liveness' ? 'awaiting_camera_for_video' : 'liveness_api_passed_awaiting_final_camera');
-
+    
     try {
       const mediaStream = await navigator.mediaDevices.getUserMedia({ video: { width: 320, height: 240, facingMode: 'user' }, audio: false });
-      setCurrentStream(mediaStream);
+      console.log("FaceCapture: startCamera - Stream obtenido de getUserMedia.");
+      setCurrentStream(mediaStream); 
     } catch (err) {
       let message = err instanceof Error ? `${err.name}: ${err.message}` : "Error desconocido de cámara.";
       if (err instanceof Error && err.name === "NotAllowedError") message = "Permiso de cámara denegado.";
+      console.error("FaceCapture: startCamera - Error en getUserMedia:", message, err);
       setError(message);
       setLivenessStep('liveness_failed_or_error');
       toast({ title: "Error de Cámara", description: message, variant: "destructive" });
-      setCurrentStream(null);
+      setCurrentStream(null); // Asegurar que currentStream es null si falla
     } finally {
       setIsStartingCamera(false);
     }
-  }, [isStartingCamera, currentStream, isCameraActive, context, livenessStep, toast]);
+  }, [isStartingCamera, currentStream, context, startRecordingSequence, toast, setIsStartingCamera, setCurrentStream, setError, setLivenessStep]);
+
 
   useEffect(() => {
     const videoNode = videoRef.current;
     if (!videoNode) return;
 
+    let aborted = false;
+
     if (currentStream) {
-      if (videoNode.srcObject !== currentStream) {
-        videoNode.srcObject = currentStream;
-      }
-      const handleCanPlay = () => {
-        videoNode.play()
-          .then(() => {
-            console.log("FaceCapture: Video reproduciéndose.");
-            setIsCameraActive(true);
-          })
-          .catch(playError => {
-            const errorMsg = `Error reproducción: ${playError instanceof Error ? playError.message : String(playError)}`;
-            console.error("FaceCapture: Error al reproducir video", playError);
-            setError(errorMsg);
-            setLivenessStep('liveness_failed_or_error');
+        console.log("FaceCapture: useEffect[currentStream] - Stream detectado. Asignando a video.");
+        if (videoNode.srcObject !== currentStream) {
+            videoNode.srcObject = currentStream;
+        }
+
+        const handleLoadedMetadata = () => {
+            if (aborted || !videoNode) return;
+            console.log("FaceCapture: useEffect[currentStream] - Evento 'loadedmetadata' en video.");
+            videoNode.play()
+                .then(() => {
+                    if (aborted) return;
+                    console.log("FaceCapture: useEffect[currentStream] - video.play() exitoso.");
+                    if (!isCameraActiveRef.current) {
+                         setIsCameraActive(true); // Update state via setter
+                         isCameraActiveRef.current = true; // Keep ref in sync
+                    }
+
+                    if (context === 'login' && livenessStepRef.current === 'awaiting_camera_for_video' && !isRecordingRef.current) {
+                        console.log("FaceCapture: useEffect[currentStream] - play() ok. Iniciando grabación para LOGIN.");
+                        startRecordingSequence(currentStream);
+                    }
+                })
+                .catch(playError => {
+                    if (aborted) return;
+                    const errorMsg = `Error reproducción: ${playError instanceof Error ? playError.message : String(playError)}`;
+                    console.error("FaceCapture: useEffect[currentStream] - Error al reproducir video:", playError);
+                    setError(errorMsg);
+                    setLivenessStep('liveness_failed_or_error');
+                    stopCamera('play_error_in_effect_currentStream'); 
+                });
+        };
+
+        videoNode.addEventListener('loadedmetadata', handleLoadedMetadata);
+        
+        // If video metadata is already loaded (e.g., stream reused quickly)
+        if (videoNode.readyState >= HTMLMediaElement.HAVE_METADATA) {
+            console.log("FaceCapture: useEffect[currentStream] - Video ya tiene metadata, llamando a handler.");
+            handleLoadedMetadata();
+        }
+
+        return () => {
+            aborted = true;
+            console.log("FaceCapture: useEffect[currentStream] - Limpiando listener 'loadedmetadata'.");
+            videoNode.removeEventListener('loadedmetadata', handleLoadedMetadata);
+        };
+    } else { // currentStream es null
+        console.log("FaceCapture: useEffect[currentStream] - currentStream es null. Limpiando video y estado de cámara activa.");
+        if (videoNode.srcObject) { // srcObject might still be there from a previous stream
+            const stream = videoNode.srcObject as MediaStream;
+            stream.getTracks().forEach(track => track.stop());
+            videoNode.srcObject = null;
+        }
+        if (isCameraActiveRef.current) {
             setIsCameraActive(false);
-            stopCamera('play_error_effect');
-          });
-      };
-      videoNode.addEventListener('canplay', handleCanPlay);
-      if (videoNode.readyState >= HTMLMediaElement.HAVE_ENOUGH_DATA && !isCameraActive) {
-         console.log("FaceCapture: Video tiene suficientes datos y no está activo, intentando reproducir.");
-        handleCanPlay();
-      }
-      return () => videoNode.removeEventListener('canplay', handleCanPlay);
-    } else {
-      if (videoNode.srcObject) videoNode.srcObject = null;
-      setIsCameraActive(false); 
+            isCameraActiveRef.current = false;
+        }
     }
-  }, [currentStream, stopCamera, isCameraActive]);
+  }, [currentStream, context, startRecordingSequence, stopCamera, setIsCameraActive, setError, setLivenessStep]);
+
 
   useEffect(() => {
-    if (isCameraActive) {
-      if (livenessStep === 'awaiting_camera_for_video') {
-        setLivenessStep('ready_to_record');
-      } else if (livenessStep === 'liveness_api_passed_awaiting_final_camera' && (context === 'signup' || context === 'admin_update')) {
+    if (isCameraActiveRef.current) { // Use ref
+      if (livenessStepRef.current === 'liveness_api_passed_awaiting_final_camera' && (context === 'signup' || context === 'admin_update')) {
         setLivenessStep('final_capture_active');
       }
     }
-  }, [isCameraActive, livenessStep, context]);
+  }, [isCameraActive, context, setLivenessStep]); // isCameraActive (state) dependency is fine here for this specific transition logic
   
   useEffect(() => {
     let message = "";
+    // Using livenessStep directly here as this effect is about reflecting current state to UI
     switch(livenessStep) {
       case 'initial':
         message = modelsLoadedRef.current ? "Listo para iniciar verificación." : "Cargando modelos...";
         if (context === 'login' && isParentProcessing) message = "Procesando inicio de sesión...";
         break;
       case 'awaiting_models': message = "Cargando modelos de reconocimiento facial..."; break;
-      case 'awaiting_camera_for_video': message = error ? error : "Iniciando cámara..."; break;
-      case 'ready_to_record': message = "Cámara lista. Preparado para grabar video de verificación."; break;
+      case 'awaiting_camera_for_video': message = error ? error : (isStartingCamera ? "Iniciando cámara..." : "Preparando cámara para grabación..."); break;
       case 'recording_video': message = "Grabando video de verificación (5s)..."; break;
       case 'verifying_video_with_api': message = "Enviando video para verificación de vida..."; break;
       case 'liveness_api_passed_awaiting_final_camera':
@@ -207,160 +410,43 @@ const FaceCapture: React.FC<FaceCaptureProps> = ({
       default: message = "Procesando...";
     }
     setStatusMessage(message);
-  }, [livenessStep, error, context, isParentProcessing]);
+  }, [livenessStep, error, context, isParentProcessing, isStartingCamera]);
 
 
-  const handleStartHumanVerification = async () => {
+  const handleStartHumanVerification = useCallback(async () => {
+    console.log("FaceCapture: handleStartHumanVerification llamado. LivenessStep actual:", livenessStepRef.current);
     if (!modelsLoadedRef.current) {
       toast({ title: "Modelos no cargados", description: "Los modelos de reconocimiento facial aún se están cargando.", variant: "default" });
       return;
     }
-    setError(null);
-    recordedChunksRef.current = [];
-    await startCamera('video_liveness');
-  };
-
-  useEffect(() => {
-    if (livenessStep === 'ready_to_record' && currentStream && videoRef.current && !isRecording && isCameraActive) {
-      setIsRecording(true);
-      setLivenessStep('recording_video');
-      try {
-        const options = { mimeType: 'video/webm;codecs=vp8' };
-        if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-            console.warn(`${options.mimeType} no es soportado, intentando con default.`);
-            // @ts-ignore
-            delete options.mimeType;
-        }
-        mediaRecorderRef.current = new MediaRecorder(currentStream, options);
-        mediaRecorderRef.current.ondataavailable = (event) => {
-          if (event.data.size > 0) recordedChunksRef.current.push(event.data);
-        };
-
-        mediaRecorderRef.current.onstop = async () => {
-          setIsRecording(false);
-          const videoBlob = new Blob(recordedChunksRef.current, { type: mediaRecorderRef.current?.mimeType || 'video/webm' });
-          recordedChunksRef.current = [];
-          const tempMediaRecorder = mediaRecorderRef.current; 
-          mediaRecorderRef.current = null;
-
-          let loginFrameDataUrl: string | null = null;
-          let loginFrameDescriptor: number[] | null = null;
-
-          if (context === 'login' && videoRef.current && captureCanvasRef.current && modelsLoadedRef.current) {
-            if (videoRef.current.readyState >= videoRef.current.HAVE_CURRENT_DATA && videoRef.current.videoWidth > 0) {
-              const video = videoRef.current;
-              const canvas = captureCanvasRef.current;
-              canvas.width = video.videoWidth;
-              canvas.height = video.videoHeight;
-              const ctx = canvas.getContext('2d');
-              if (ctx) {
-                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-                loginFrameDataUrl = canvas.toDataURL('image/png');
-                try {
-                  const detection = await faceapi.detectSingleFace(canvas, new faceapi.TinyFaceDetectorOptions({ inputSize: 320 }))
-                    .withFaceLandmarks().withFaceDescriptor();
-                  if (detection) {
-                    loginFrameDescriptor = Array.from(detection.descriptor);
-                    console.log("FaceCapture: Descriptor del cuadro de video (login) calculado.");
-                  } else {
-                     console.warn("FaceCapture: No se detectó rostro en el cuadro del video para login.");
-                  }
-                } catch (e) { console.error("FaceCapture: Error en descriptor de cuadro para login:", e); }
-              }
-            } else {
-                console.warn("FaceCapture: El video no estaba listo para capturar el cuadro (login).");
-            }
-          }
-
-          stopCamera('video_recording_finished');
-          setCurrentStream(null); 
-
-          setLivenessStep('verifying_video_with_api');
-          setIsVerifyingWithAPI(true);
-
-          if (videoBlob.size > MAX_VIDEO_SIZE_MB * 1024 * 1024) {
-            toast({ title: "Video Demasiado Grande", description: `El video grabado excede los ${MAX_VIDEO_SIZE_MB}MB. Intenta de nuevo.`, variant: "destructive" });
-            setError(`Video demasiado grande (${(videoBlob.size / (1024*1024)).toFixed(2)} MB)`);
-            if (context === 'login') onFaceCaptured(null, null, false); else setLivenessStep('liveness_failed_or_error');
-            setIsVerifyingWithAPI(false);
-            return;
-          }
-          const formData = new FormData();
-          formData.append("prompt", "Verifica si la persona en el video es real y viva.");
-          formData.append("video_file", videoBlob, `liveness_video.${tempMediaRecorder?.mimeType.split('/')[1].split(';')[0] || 'webm'}`);
-          try {
-            const response = await fetch("https://facesip-ia-127465468754.us-central1.run.app", { method: "POST", body: formData });
-            if (!response.ok) throw new Error(`Error de API: ${response.status} ${response.statusText}`);
-            const outerResponse = await response.json();
-            let isLivePerson = false;
-            try {
-                const innerJsonResponseString = outerResponse.response;
-                const innerJsonResponse = JSON.parse(innerJsonResponseString);
-                const finalDataString = innerJsonResponse.response;
-                const finalData = JSON.parse(finalDataString);
-                isLivePerson = finalData.isLivePerson === true;
-            } catch (parseError) { throw new Error("Respuesta de API malformada."); }
-
-            if (isLivePerson) {
-              if (context === 'login') {
-                // No mostrar toast aquí, LoginForm lo hará.
-                // onFaceCaptured se llama con livenessVerificationPassed = true
-                onFaceCaptured(loginFrameDataUrl, loginFrameDescriptor, true);
-                setLivenessStep('initial'); 
-              } else { // signup or admin_update
-                toast({ title: "Verificación Humana Exitosa", description: "Persona real detectada. Puedes proceder a la captura final.", duration: 3000 });
-                setLivenessStep('liveness_api_passed_ready_for_manual_final_capture');
-              }
-            } else {
-              toast({ title: "Verificación Humana Fallida", description: "No se pudo confirmar que eres una persona real. Intenta de nuevo.", variant: "destructive", duration: 5000 });
-              setError("Verificación de vida fallida. Asegura buena iluminación y mira a la cámara.");
-              if (context === 'login') onFaceCaptured(null, null, false); else setLivenessStep('liveness_failed_or_error');
-            }
-          } catch (apiError) {
-            const apiErrorMsg = apiError instanceof Error ? apiError.message : String(apiError);
-            toast({ title: "Error de Verificación", description: `No se pudo completar la verificación: ${apiErrorMsg}`, variant: "destructive" });
-            setError(`Error de comunicación con el servicio de verificación: ${apiErrorMsg}`);
-            if (context === 'login') onFaceCaptured(null, null, false); else setLivenessStep('liveness_failed_or_error');
-          } finally { setIsVerifyingWithAPI(false); }
-        };
-        mediaRecorderRef.current.start();
-        setTimeout(() => {
-          if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-            mediaRecorderRef.current.stop();
-          }
-        }, VIDEO_RECORDING_DURATION_MS);
-      } catch (mediaRecorderError) {
-        const mrErrorMsg = mediaRecorderError instanceof Error ? mediaRecorderError.message : String(mediaRecorderError);
-        toast({ title: "Error de Grabación", description: `No se pudo iniciar la grabación de video. ${mrErrorMsg}`, variant: "destructive" });
+    setError(null); // Clear previous errors
+    // Reset relevant states if retrying from a non-initial state, though `handleRetry` is better for full resets
+    if (livenessStepRef.current !== 'initial') {
         setIsRecording(false);
-        setError(`Error al iniciar la grabación: ${mrErrorMsg}`);
-        stopCamera('media_recorder_init_error');
-        setCurrentStream(null);
-        if (context === 'login') onFaceCaptured(null, null, false); else setLivenessStep('liveness_failed_or_error');
-      }
+        setIsVerifyingWithAPI(false);
+        // stopCamera('pre_verification_start_if_not_initial'); // Ensure camera is stopped before starting a new attempt
     }
-  }, [livenessStep, currentStream, isRecording, stopCamera, toast, context, onFaceCaptured, isCameraActive]);
-
+    await startCamera('video_liveness');
+  }, [startCamera, toast, setError, setIsRecording, setIsVerifyingWithAPI]);
+  
   useEffect(() => {
-    if (livenessStep === 'liveness_api_passed_ready_for_manual_final_capture' && (context === 'signup' || context === 'admin_update')) {
+    if (livenessStepRef.current === 'liveness_api_passed_ready_for_manual_final_capture' && (context === 'signup' || context === 'admin_update')) {
       startCamera('final_capture');
     }
-  }, [livenessStep, context, startCamera]);
+  }, [livenessStep, context, startCamera]); // livenessStep (state) dependency here for this transition
 
   useEffect(() => {
-    if (livenessStep === 'final_capture_active' && isCameraActive && modelsLoadedRef.current && !detectionIntervalRef.current && videoRef.current && (context === 'signup' || context === 'admin_update')) {
+    if (livenessStepRef.current === 'final_capture_active' && isCameraActiveRef.current && modelsLoadedRef.current && !detectionIntervalRef.current && videoRef.current && (context === 'signup' || context === 'admin_update')) {
         const video = videoRef.current;
         const canvas = detectionCanvasRef.current;
         if (!canvas) return;
         console.log("FaceCapture: Iniciando intervalo de detección para captura final manual.");
         detectionIntervalRef.current = setInterval(async () => {
             if (!videoRef.current || video.paused || video.ended || video.readyState < video.HAVE_ENOUGH_DATA) {
-                console.log("FaceCapture: Intervalo - Video no listo para detección.");
                 return;
             }
             const displaySize = { width: video.videoWidth, height: video.videoHeight };
             if (displaySize.width === 0 || displaySize.height === 0) {
-                console.log("FaceCapture: Intervalo - Dimensiones de video inválidas para detección.");
                 return;
             }
             faceapi.matchDimensions(canvas, displaySize);
@@ -375,8 +461,7 @@ const FaceCapture: React.FC<FaceCaptureProps> = ({
                 faceapi.draw.drawDetections(canvas, resizedDetections);
             }
         }, 250);
-    } else if ((livenessStep !== 'final_capture_active' || !isCameraActive || context === 'login') && detectionIntervalRef.current) {
-        console.log("FaceCapture: Limpiando intervalo de detección.");
+    } else if ((livenessStepRef.current !== 'final_capture_active' || !isCameraActiveRef.current || context === 'login') && detectionIntervalRef.current) {
         clearInterval(detectionIntervalRef.current);
         detectionIntervalRef.current = null;
         if(detectionCanvasRef.current) {
@@ -386,15 +471,14 @@ const FaceCapture: React.FC<FaceCaptureProps> = ({
     }
     return () => {
         if (detectionIntervalRef.current) {
-            console.log("FaceCapture: Limpiando intervalo de detección en cleanup de efecto.");
             clearInterval(detectionIntervalRef.current);
         }
     };
-  }, [livenessStep, isCameraActive, context]);
+  }, [livenessStep, isCameraActive, context]); // livenessStep & isCameraActive (state) dependencies are fine for detection interval
 
   const handleManualFinalCapture = useCallback(async () => {
-    if (!videoRef.current || !captureCanvasRef.current || !currentStream || !isCameraActive ||
-        livenessStep !== 'final_capture_active' || !(context === 'signup' || context === 'admin_update')) {
+    if (!videoRef.current || !captureCanvasRef.current || !currentStream || !isCameraActiveRef.current ||
+        livenessStepRef.current !== 'final_capture_active' || !(context === 'signup' || context === 'admin_update')) {
       toast({ title: "Error de Captura", description: "La cámara no está lista o no se ha verificado la identidad.", variant: "destructive" });
       return;
     }
@@ -420,26 +504,28 @@ const FaceCapture: React.FC<FaceCaptureProps> = ({
     } catch (descError) {
       toast({ title: "Error Descriptor", description: `Falló cálculo del descriptor final: ${descError instanceof Error ? descError.message : String(descError)}`, variant: "destructive" });
     }
-    onFaceCaptured(dataUrl, descriptor, true); // Assume liveness passed if we reach manual capture
+    onFaceCaptured(dataUrl, descriptor, true); 
     stopCamera('manual_final_capture_complete');
-    setCurrentStream(null);
     setIsProcessingFinalCapture(false);
-    setLivenessStep('initial');
-  }, [currentStream, isCameraActive, livenessStep, onFaceCaptured, stopCamera, toast, context]);
+    setLivenessStep('initial'); // Reset to initial state after capture
+  }, [currentStream, context, onFaceCaptured, stopCamera, toast, setIsProcessingFinalCapture, setLivenessStep]);
 
-  const handleRetry = () => {
+  const handleRetry = useCallback(() => {
+    console.log("FaceCapture: handleRetry llamado.");
     stopCamera('retry_button');
-    setCurrentStream(null);
     setError(null);
     setIsRecording(false);
     setIsVerifyingWithAPI(false);
     setIsProcessingFinalCapture(false);
-    setLivenessStep('initial');
-    if (!modelsLoadedRef.current) loadModels();
-  };
+    setLivenessStep('initial'); // This should make the initial button show
+    if (!modelsLoadedRef.current) {
+        loadModels();
+    }
+  }, [stopCamera, setError, setIsRecording, setIsVerifyingWithAPI, setIsProcessingFinalCapture, setLivenessStep, loadModels]);
 
   useEffect(() => {
     return () => {
+      console.log("FaceCapture: Desmontando componente, llamando a stopCamera.");
       stopCamera('component_unmount');
     };
   }, [stopCamera]);
@@ -447,9 +533,19 @@ const FaceCapture: React.FC<FaceCaptureProps> = ({
   const imageSize = 320;
   const previewStyle = { width: `${imageSize}px`, height: `${imageSize * 0.75}px` };
 
-  const showInitialButton = (livenessStep === 'initial' || (livenessStep === 'liveness_api_passed_awaiting_final_camera' && context === 'login')) && modelsLoadedRef.current && !error;
-  const showRetryButton = livenessStep === 'liveness_failed_or_error' && !isStartingCamera && !isRecording && !isVerifyingWithAPI;
+  // Conditions for button visibility - using direct state values
+  const showInitialButton = (
+      livenessStep === 'initial' || 
+      // For login, if liveness passed but parent is not yet processing or failed, allow restart.
+      // However, if parent IS processing, button should be disabled (handled by isParentProcessing prop)
+      (livenessStep === 'liveness_api_passed_awaiting_final_camera' && context === 'login' && !isParentProcessing)
+    ) && modelsLoadedRef.current && !error && !isStartingCamera && !isRecording && !isVerifyingWithAPI;
+
+  const showRetryButton = livenessStep === 'liveness_failed_or_error' && !isStartingCamera && !isRecording && !isVerifyingWithAPI && !isProcessingFinalCapture;
   const showManualFinalCaptureButton = (livenessStep === 'liveness_api_passed_ready_for_manual_final_capture' || livenessStep === 'final_capture_active') && isCameraActive && !isProcessingFinalCapture && (context === 'signup' || context === 'admin_update');
+  
+  console.log(`FaceCapture RENDER: livenessStep=${livenessStep}, isCameraActive=${isCameraActive}, isRecording=${isRecording}, isStartingCamera=${isStartingCamera}, error=${error}, isParentProcessing=${isParentProcessing}, showInitialButton=${showInitialButton}`);
+
 
   return (
     <div className="flex flex-col items-center gap-4 w-full max-w-md">
@@ -500,20 +596,15 @@ const FaceCapture: React.FC<FaceCaptureProps> = ({
           onClick={handleStartHumanVerification} 
           className="w-full" 
           disabled={
-            isStartingCamera || 
+            isStartingCamera || // Already trying to start
+            isRecording || // Already recording
+            isVerifyingWithAPI || // Already verifying
             !modelsLoadedRef.current || 
-            isVerifyingWithAPI || 
-            (context === 'login' && isParentProcessing) 
+            (context === 'login' && isParentProcessing) // Parent is busy
           }
         >
           {context === 'login' && isParentProcessing ? <Loader2 className="mr-2 animate-spin" /> : <UserCheck className="mr-2" />}
           {context === 'login' && isParentProcessing ? "Procesando inicio de sesión..." : initialButtonText}
-        </Button>
-      )}
-
-      {livenessStep === 'ready_to_record' && isCameraActive && !isRecording && !isVerifyingWithAPI && (
-        <Button className="w-full" disabled={true}>
-            <Video className="mr-2" /> Preparado para grabar...
         </Button>
       )}
 
@@ -549,5 +640,3 @@ const FaceCapture: React.FC<FaceCaptureProps> = ({
 };
 
 export default FaceCapture;
-
-    
