@@ -14,12 +14,12 @@ import { Loader2 } from 'lucide-react';
 export default function SignupForm() {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
-  const [isProcessingSignup, setIsProcessingSignup] = useState(false); // Renamed for clarity
+  const [isProcessingSignup, setIsProcessingSignup] = useState(false);
   const { signup, loading: authLoading } = useAuth();
   const router = useRouter();
   const { toast } = useToast();
 
-  // This function is called by FaceCapture AFTER liveness check and final image capture
+  // This function is called by FaceCapture AFTER liveness (video) check AND final image capture
   const handleFaceVerifiedAndCaptured = async (faceDataUrl: string, faceDescriptor: number[] | null) => {
     if (!name || !email) {
       toast({ title: "Información Faltante", description: "Por favor, completa tu nombre y correo electrónico.", variant: "destructive" });
@@ -32,7 +32,6 @@ export default function SignupForm() {
 
     setIsProcessingSignup(true);
     try {
-      // Signup now expects the descriptor
       const success = await signup(name, email, faceDataUrl, faceDescriptor); 
 
       if (success) {
@@ -85,6 +84,7 @@ export default function SignupForm() {
         </p>
         <FaceCapture 
             onFaceCaptured={handleFaceVerifiedAndCaptured} 
+            initialButtonText="Iniciar Verificación Humana"
             mainCaptureButtonTextIfLive="Capturar Rostro y Crear Cuenta"
             context="signup" 
         />
